@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>FCM Client Test</title>
+<style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 30px auto; padding: 0 20px; color: #212529; }
+    h1 { color: #B20605; }
+    .card { border: 1px solid #dee2e6; border-radius: 8px; padding: 16px; margin-bottom: 16px; background: #fafafa; }
+    .card h2 { margin: 0 0 10px; font-size: 15px; color: #1E1B4B; }
+    label { display: block; margin: 6px 0 3px; font-size: 12px; font-weight: 600; }
+    input[type=text], textarea {
+        width: 100%; padding: 6px 8px; border: 1px solid #ced4da; border-radius: 4px;
+        font-size: 12px; font-family: "Courier New", monospace; box-sizing: border-box;
+    }
+    button {
+        background: #B20605; color: #fff; border: none; padding: 8px 14px;
+        border-radius: 4px; cursor: pointer; font-weight: 600; margin-right: 6px; margin-top: 8px;
+    }
+    button:disabled { background: #999; cursor: not-allowed; }
+    .out { background: #212529; color: #d1e7dd; padding: 8px; border-radius: 4px;
+           font-family: "Courier New", monospace; font-size: 11px; word-break: break-all;
+           max-height: 200px; overflow: auto; margin-top: 8px; }
+    .warn { color: #B20605; font-size: 11px; }
+    small { color: #6c757d; font-size: 11px; }
+    code { background: #eef; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<h1>🔔 FCM Client Test</h1>
+<p><small>Halaman standalone utk generate FCM token dari browser + subscribe/send test via backend dev endpoint.
+Bukan bagian dari PWA — cukup tools debugging.</small></p>
+
+<div class="card">
+    <h2>1. Firebase Web Config</h2>
+    <p><small>Ambil dari Firebase Console → Project settings (⚙️) → General → Your apps →
+    Web app (kalau belum ada, klik &lt;/&gt; Add app → Web) → Firebase SDK snippet → Config.</small></p>
+    <label>apiKey</label>
+    <input type="text" id="apiKey" placeholder="AIzaSy...">
+    <label>authDomain</label>
+    <input type="text" id="authDomain" value="golden-f64c8.firebaseapp.com">
+    <label>projectId</label>
+    <input type="text" id="projectId" value="golden-f64c8">
+    <label>storageBucket</label>
+    <input type="text" id="storageBucket" value="golden-f64c8.firebasestorage.app">
+    <label>messagingSenderId</label>
+    <input type="text" id="messagingSenderId" placeholder="1234567890">
+    <label>appId</label>
+    <input type="text" id="appId" placeholder="1:1234567890:web:abcdef">
+    <label>VAPID public key <small style="font-weight:normal;">(Cloud Messaging → tab <b>Web configuration</b> → Web Push certificates → tombol copy 📋 di kolom Key pair. Biasanya mulai dgn "B" dan ~87 char.)</small></label>
+    <input type="text" id="vapidKey" placeholder="BEl62iUYgUivxIkv69yViEuiBIa-Ib9-...">
+    <button onclick="saveConfig()">Save Config (localStorage)</button>
+    <button onclick="loadConfig()">Load Saved</button>
+</div>
+
+<div class="card">
+    <h2>2. Request FCM Token</h2>
+    <p><small>Klik → browser minta izin notif → generate token. Token muncul di kotak bawah.</small></p>
+    <button id="btnGetToken" onclick="requestToken()">Request Permission + Get Token</button>
+    <div class="out" id="tokenOut">(belum request)</div>
+</div>
+
+<div class="card">
+    <h2>3. Subscribe ke Topic (via backend /api/dev/fcm/subscribe)</h2>
+    <label>Topic</label>
+    <input type="text" id="subTopic" value="test_topic">
+    <button onclick="doSubscribe()">Subscribe Token → Topic</button>
+    <button onclick="doUnsubscribe()">Unsubscribe</button>
+    <div class="out" id="subOut">(belum subscribe)</div>
+</div>
+
+<div class="card">
+    <h2>4. Trigger Push Test (via backend /api/dev/fcm/send)</h2>
+    <label>Topic</label>
+    <input type="text" id="sendTopic" value="test_topic">
+    <label>Title</label>
+    <input type="text" id="sendTitle" value="Hello 👋">
+    <label>Body</label>
+    <input type="text" id="sendBody" value="Push dari backend + Firebase.">
+    <button onclick="doSend()">Send to Topic</button>
+    <div class="out" id="sendOut">(belum send)</div>
+    <p class="warn">Setelah klik Send, notif harus muncul:<br>
+    - <b>Tab HALAMAN INI aktif</b> → toast custom di dalam halaman (bawah).<br>
+    - <b>Tab lain / minimized</b> → notif OS muncul (butuh service worker aktif).</p>
+</div>
+
+<div class="card">
+    <h2>Log foreground push</h2>
+    <div class="out" id="fgLog">(menunggu push)</div>
+</div>
+
+<div id="toast" style="position:fixed;bottom:20px;right:20px;background:#0f5132;color:#fff;
+    padding:12px 16px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.2);
+    display:none;max-width:320px;font-size:13px;"></div>
+
+<script type="module">
+import { initializeApp }
+  from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
+import { getMessaging, getToken, onMessage, deleteToken }
+  from "https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging.js";
+
+let messaging  = null;
+let currentTok = null;
+
+const $ = id => document.getElementById(id);
+
+function setOut(id, obj) {
+    $(id).textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+}
+function toast(msg) {
+    const t = $("toast");
+    t.textContent = msg;
+    t.style.display = "block";
+    setTimeout(() => { t.style.display = "none"; }, 5000);
+}
+
+// ==================== Config persistence ====================
+const CFG_KEYS = ["apiKey","authDomain","projectId","storageBucket","messagingSenderId","appId","vapidKey"];
+window.saveConfig = () => {
+    const cfg = {};
+    CFG_KEYS.forEach(k => cfg[k] = $(k).value);
+    localStorage.setItem("fcmTestCfg", JSON.stringify(cfg));
+    toast("Config disimpan di localStorage.");
+};
+window.loadConfig = () => {
+    try {
+        const raw = localStorage.getItem("fcmTestCfg");
+        if (!raw) return toast("Belum ada config tersimpan.");
+        const cfg = JSON.parse(raw);
+        CFG_KEYS.forEach(k => { if (cfg[k]) $(k).value = cfg[k]; });
+        toast("Config di-load.");
+    } catch (e) { toast("Load error: " + e.message); }
+};
+window.loadConfig(); // auto-load kalau ada
+
+// ==================== Init Firebase + get token ====================
+// Strip semua whitespace + karakter non-printable dari input paste.
+function cleanInput(v) {
+    return String(v || "").replace(/[\s\r\n\t ]/g, "");
+}
+function readConfig() {
+    const cfg = {};
+    CFG_KEYS.forEach(k => cfg[k] = cleanInput($(k).value));
+    // VAPID key extra-strict: buang semua char non URL-safe-base64
+    // (kadang copy dari console nyelipin zero-width space / nbsp).
+    if (cfg.vapidKey) cfg.vapidKey = cfg.vapidKey.replace(/[^A-Za-z0-9_\-]/g, "");
+    if (!cfg.apiKey || !cfg.projectId || !cfg.messagingSenderId || !cfg.appId) {
+        throw new Error("apiKey, projectId, messagingSenderId, appId wajib.");
+    }
+    // VAPID key: URL-safe base64 (huruf, angka, '-', '_'). Pastikan format-nya
+    // benar sebelum kirim ke Firebase (kalau ada karakter aneh, Firebase SDK
+    // panggil atob() dan throw InvalidCharacterError).
+    if (cfg.vapidKey) {
+        if (!/^[A-Za-z0-9_\-]+$/.test(cfg.vapidKey)) {
+            throw new Error(
+                "VAPID key format salah — hanya boleh berisi huruf, angka, '-', '_'. " +
+                "Panjang normal 87-88 char. Copy ulang dari Firebase Console " +
+                "→ Cloud Messaging → Web Push certificates → tombol copy (⧉) di sebelah 'Key pair'.");
+        }
+        if (cfg.vapidKey.length < 80 || cfg.vapidKey.length > 100) {
+            throw new Error(
+                `VAPID key panjangnya ${cfg.vapidKey.length} char — normal 87-88 char. Copy ulang.`);
+        }
+    }
+    return cfg;
+}
+
+window.requestToken = async () => {
+    try {
+        const cfg = readConfig();
+        if (!cfg.vapidKey) throw new Error("VAPID key wajib utk web push.");
+
+        setOut("tokenOut", "Init Firebase...");
+        const app = initializeApp({
+            apiKey: cfg.apiKey,
+            authDomain: cfg.authDomain,
+            projectId: cfg.projectId,
+            storageBucket: cfg.storageBucket,
+            messagingSenderId: cfg.messagingSenderId,
+            appId: cfg.appId,
+        }, "fcm-test-" + Date.now()); // unique app name supaya bisa re-init
+        messaging = getMessaging(app);
+
+        // Register service worker (background notif). File harus disajikan
+        // dari root: /firebase-messaging-sw.js
+        const swReg = await navigator.serviceWorker.register("/firebase-messaging-sw.js")
+            .catch(e => { console.warn("SW register gagal:", e); return null; });
+
+        setOut("tokenOut", "Minta izin notifikasi...");
+        const perm = await Notification.requestPermission();
+        if (perm !== "granted") throw new Error("Izin ditolak.");
+
+        setOut("tokenOut", "Ambil token...");
+        currentTok = await getToken(messaging, {
+            vapidKey: cfg.vapidKey,
+            serviceWorkerRegistration: swReg || undefined,
+        });
+        setOut("tokenOut", currentTok || "(kosong — mungkin ada masalah)");
+
+        // Foreground handler
+        onMessage(messaging, payload => {
+            const line = new Date().toLocaleTimeString() + " → " + JSON.stringify(payload);
+            const el = $("fgLog");
+            el.textContent = line + "\n" + el.textContent;
+            const n = payload.notification;
+            if (n) toast("🔔 " + (n.title || "") + " — " + (n.body || ""));
+        });
+
+        toast("Token OK — copy ke Subscribe di bawah kalau perlu.");
+    } catch (e) {
+        setOut("tokenOut", "ERROR: " + e.message);
+        console.error(e);
+    }
+};
+
+// ==================== Backend calls ====================
+async function api(url, body) {
+    const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    return await res.json();
+}
+
+window.doSubscribe = async () => {
+    if (!currentTok) return setOut("subOut", "Belum ada token — klik step 2 dulu.");
+    try {
+        const res = await api("/api/dev/fcm/subscribe",
+            { token: currentTok, topic: $("subTopic").value.trim() });
+        setOut("subOut", res);
+    } catch (e) { setOut("subOut", "ERROR: " + e.message); }
+};
+
+window.doUnsubscribe = async () => {
+    if (!currentTok) return setOut("subOut", "Belum ada token.");
+    try {
+        const res = await api("/api/dev/fcm/unsubscribe",
+            { token: currentTok, topic: $("subTopic").value.trim() });
+        setOut("subOut", res);
+    } catch (e) { setOut("subOut", "ERROR: " + e.message); }
+};
+
+window.doSend = async () => {
+    try {
+        const res = await api("/api/dev/fcm/send", {
+            topic: $("sendTopic").value.trim(),
+            title: $("sendTitle").value,
+            body:  $("sendBody").value,
+        });
+        setOut("sendOut", res);
+    } catch (e) { setOut("sendOut", "ERROR: " + e.message); }
+};
+</script>
+
+</body>
+</html>
